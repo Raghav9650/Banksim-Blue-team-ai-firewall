@@ -13,6 +13,11 @@ import {
 } from "./firewall.ts";
 import { verifyBankSimAccessToken } from "./auth.ts";
 import {
+  analyzeWithGemini,
+  combineHybridFirewallDecision,
+  normalizeBankSimRequest,
+} from "./ai-analyzer.ts";
+import {
   auditPersistenceMode,
   fetchFirewallLogs,
   fetchFirewallMetrics,
@@ -146,13 +151,44 @@ async function createPersistedEvaluation(
   encryptedAuditPayload: string,
   requestStartedAt: number,
 ) {
-  const firewallEvaluation = evaluateBankSimFirewall(parsedRequest);
+  const normalizedRequest = normalizeBankSimRequest(parsedRequest);
+  const firewallEvaluation = evaluateBankSimFirewall(normalizedRequest);
+  const aiResult = await analyzeWithGemini(normalizedRequest);
+  const hybridDecision = combineHybridFirewallDecision(
+    firewallEvaluation.decision.status,
+    firewallEvaluation.decision.risk_score,
+    aiResult,
+  );
+  const finalStatus =
+    hybridDecision.final_decision === "ALLOW" ? "APPROVED" : "BLOCKED";
+  const finalRiskScore = Number(
+    Math.max(
+      firewallEvaluation.decision.risk_score,
+      (aiResult.analysis?.riskScore ?? 0) / 100,
+    ).toFixed(4),
+  );
+  const finalThreatCategory =
+    firewallEvaluation.decision.status === "BLOCKED"
+      ? firewallEvaluation.decision.threat_category
+      : aiResult.analysis?.threatDetected
+        ? aiResult.analysis.threatCategory
+        : firewallEvaluation.decision.threat_category;
+  const finalDecision = {
+    status: finalStatus,
+    risk_score: finalRiskScore,
+    threat_category: finalThreatCategory,
+    explanation: hybridDecision.explanation,
+    final_decision: hybridDecision.final_decision,
+    deterministic_status: hybridDecision.deterministic_status,
+    deterministic_risk_score: hybridDecision.deterministic_risk_score,
+    ai: hybridDecision.ai,
+  };
   const evaluationTimestamp = new Date().toISOString();
   const complianceHash = createHash("sha256")
     .update(
       JSON.stringify({
         encryptedAuditPayload,
-        decision: firewallEvaluation.decision,
+        decision: finalDecision,
         timestamp: evaluationTimestamp,
       }),
     )
@@ -161,18 +197,25 @@ async function createPersistedEvaluation(
     user_id: accountOwnerId,
     timestamp: evaluationTimestamp,
     incoming_prompt: encryptedAuditPayload,
-    target_tool: parsedRequest.target_tool,
-    firewall_status: firewallEvaluation.decision.status,
-    risk_score: firewallEvaluation.decision.risk_score,
-    threat_category: firewallEvaluation.decision.threat_category,
-    engine_explanation: firewallEvaluation.decision.explanation,
+    target_tool: normalizedRequest.target_tool,
+    firewall_status: finalStatus,
+    risk_score: finalRiskScore,
+    threat_category: finalThreatCategory,
+    engine_explanation: hybridDecision.explanation,
     sanitized_payload:
-      firewallEvaluation.decision.status === "APPROVED" ? encryptedAuditPayload : null,
-    signals: firewallEvaluation.signals,
+      hybridDecision.final_decision === "ALLOW" ? encryptedAuditPayload : null,
+    signals: {
+      ...firewallEvaluation.signals,
+      final_decision: hybridDecision.final_decision,
+    },
     compliance_hash: complianceHash,
     latency_ms: Math.max(0, Date.now() - requestStartedAt),
   });
-  return firewallEvaluation;
+  return {
+    ...firewallEvaluation,
+    decision: finalDecision,
+    hybrid: hybridDecision,
+  };
 }
 
 async function readStrictFirewallRequest(request: Request, response: Response) {
@@ -185,8 +228,9 @@ async function readStrictFirewallRequest(request: Request, response: Response) {
     );
     return null;
   }
+  const normalizedRequest = normalizeBankSimRequest(validatedRequest.data);
   try {
-    const encryptedAuditEnvelope: unknown = JSON.parse(validatedRequest.data.encrypted_audit_payload);
+    const encryptedAuditEnvelope: unknown = JSON.parse(normalizedRequest.encrypted_audit_payload);
     if (
       !encryptedAuditEnvelope ||
       typeof encryptedAuditEnvelope !== "object" ||
@@ -216,11 +260,11 @@ async function readStrictFirewallRequest(request: Request, response: Response) {
     );
     return null;
   }
-  if (!toolAllowlist.has(validatedRequest.data.target_tool)) {
+  if (!toolAllowlist.has(normalizedRequest.target_tool)) {
     response.status(400).json(blockedBoundaryDecision("The requested tool is not on the simulator allowlist."));
     return null;
   }
-  return validatedRequest.data satisfies FirewallRequest & { encrypted_audit_payload: string };
+  return normalizedRequest satisfies FirewallRequest & { encrypted_audit_payload: string };
 }
 
 app.get("/api/health", (_request, response) => {
@@ -296,7 +340,10 @@ app.post("/api/banking/simulate", async (request, response, next) => {
       parsedRequest.encrypted_audit_payload,
       (request as Request & RequestState).requestStartedAt,
     );
-    if (firewallEvaluation.decision.status !== "APPROVED") {
+    if (
+      firewallEvaluation.decision.final_decision !== "ALLOW" ||
+      firewallEvaluation.decision.status !== "APPROVED"
+    ) {
       response.status(403).json(firewallEvaluation.decision);
       return;
     }

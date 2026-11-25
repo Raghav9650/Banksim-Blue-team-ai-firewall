@@ -9,11 +9,50 @@ export type ThreatCategory =
 export type TargetTool = "BALANCE_CHECK" | "TRANSFER_SIMULATION" | "MEMO_REVIEW";
 export type ViewName = "overview" | "sandbox" | "ledger";
 
+export type AiAvailabilityStatus =
+  | "LIVE_AI"
+  | "FALLBACK_MODEL"
+  | "FALLBACK_DETERMINISTIC"
+  | "AI_QUOTA_EXCEEDED"
+  | "AI_TIMEOUT"
+  | "AI_UNCONFIGURED";
+
+export type FinalPolicyDecision = "ALLOW" | "BLOCK" | "REVIEW";
+
+export interface AiThreatAnalysis {
+  threatDetected: boolean;
+  threatCategory: ThreatCategory;
+  riskScore: number;
+  confidence: number;
+  explanation: string;
+  recommendedAction: "ALLOW" | "BLOCK" | "REVIEW";
+}
+
+export interface AiAnalysisResult {
+  analysis: AiThreatAnalysis | null;
+  status: AiAvailabilityStatus;
+  durationMs: number;
+  model: string | null;
+  message?: string;
+}
+
+export interface HybridFirewallDecision {
+  final_decision: FinalPolicyDecision;
+  deterministic_status: "APPROVED" | "BLOCKED";
+  deterministic_risk_score: number;
+  ai: AiAnalysisResult;
+  explanation: string;
+}
+
 export interface FirewallDecision {
   status: FirewallStatus;
   risk_score: number;
   threat_category: ThreatCategory;
   explanation: string;
+  final_decision?: FinalPolicyDecision;
+  deterministic_status?: "APPROVED" | "BLOCKED";
+  deterministic_risk_score?: number;
+  ai?: AiAnalysisResult;
 }
 
 export interface FirewallRequest {
@@ -36,6 +75,7 @@ export interface FirewallSignals {
   punctuation_density: number;
   structural_irregularity: number;
   scanned_characters: number;
+  final_decision?: FinalPolicyDecision;
 }
 
 export interface FirewallLog {
@@ -65,7 +105,7 @@ export interface FirewallMetrics {
   average_risk: number;
   memos_inspected: number;
   health_coefficient: number;
-  timeline: Array<{ label: string; approved: number; blocked: number }>;
+  timeline: Array<{ label: string; approved: number; blocked: number; review: number }>;
   category_totals: Array<{ category: ThreatCategory; count: number }>;
 }
 

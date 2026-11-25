@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  clearUserAuditEncryptionKeyCache,
   createUserAuditEncryptionKey,
   decryptAuditLog,
   decryptPrivateAuditValue,
@@ -36,6 +37,30 @@ describe("private user audit encryption", () => {
     );
   });
 
+  it("caches derived keys in memory and clears the cache on request", async () => {
+    clearUserAuditEncryptionKeyCache();
+    const firstKey = await createUserAuditEncryptionKey(
+      privateAuditPassword,
+      privateAuditAccountId,
+      privateAuditSalt,
+    );
+    const cachedKey = await createUserAuditEncryptionKey(
+      privateAuditPassword,
+      privateAuditAccountId,
+      privateAuditSalt,
+    );
+
+    expect(cachedKey).toBe(firstKey);
+
+    clearUserAuditEncryptionKeyCache();
+    const keyAfterClear = await createUserAuditEncryptionKey(
+      privateAuditPassword,
+      privateAuditAccountId,
+      privateAuditSalt,
+    );
+    expect(keyAfterClear).not.toBe(firstKey);
+  });
+
   it("does not accept another account's derived key or edited ciphertext", async () => {
     const accountOnePrivateKey = await createUserAuditEncryptionKey(
       privateAuditPassword,
@@ -61,6 +86,48 @@ describe("private user audit encryption", () => {
         JSON.stringify({ ...secretEnvelope, ciphertext: `${secretEnvelope.ciphertext.slice(0, -4)}AAAA` }),
       ),
     ).rejects.toThrow("could not be decrypted");
+  });
+
+  it("marks audit content encrypted with a prior credential without throwing", async () => {
+    const originalKey = await createUserAuditEncryptionKey(
+      privateAuditPassword,
+      privateAuditAccountId,
+      privateAuditSalt,
+    );
+    const otherKey = await createUserAuditEncryptionKey(
+      "different password for the same account",
+      privateAuditAccountId,
+      privateAuditSalt,
+    );
+    const encryptedRequest = await encryptAuditRequest(originalKey, {
+      target_tool: "MEMO_REVIEW",
+      memo: "prior credential memo",
+    });
+    const lockedRow: UserAuditLog = {
+      log_id: "6765b32b-0959-45ad-80ec-1088b695ca6e",
+      user_id: privateAuditAccountId,
+      timestamp: "2026-10-11T00:00:00.000Z",
+      incoming_prompt: encryptedRequest,
+      target_tool: "MEMO_REVIEW",
+      firewall_status: "APPROVED",
+      risk_score: 0,
+      threat_category: "NONE",
+      engine_explanation: "Approved.",
+      sanitized_payload: null,
+      signals: {
+        character_entropy: 0.5,
+        manipulation_markers: 0,
+        punctuation_density: 0,
+        structural_irregularity: 0,
+        scanned_characters: 22,
+      },
+      compliance_hash: "a".repeat(64),
+      latency_ms: 3,
+    };
+
+    const decryptedRow = await decryptAuditLog(otherKey, lockedRow);
+
+    expect(decryptedRow.incoming_prompt).toBe("Encrypted with prior credentials");
   });
 
   it("decrypts a user's own prompt for the ledger and leaves blocked payloads private", async () => {

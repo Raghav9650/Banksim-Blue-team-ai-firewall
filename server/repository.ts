@@ -78,7 +78,11 @@ export async function fetchFirewallLogs(
 }
 
 function constructMetrics(auditRows: FirewallLog[]): FirewallMetrics {
-  const blockedRows = auditRows.filter((row) => row.firewall_status === "BLOCKED");
+  const blockedRows = auditRows.filter(
+    (row) =>
+      row.firewall_status === "BLOCKED" &&
+      row.signals.final_decision !== "REVIEW",
+  );
   const averageRisk =
     auditRows.length === 0
       ? 0
@@ -107,7 +111,12 @@ function constructMetrics(auditRows: FirewallLog[]): FirewallMetrics {
     hourlyTimeline.push({
       label: hourStart.toLocaleTimeString("en-US", { hour: "2-digit", hour12: false }),
       approved: hourRows.filter((row) => row.firewall_status === "APPROVED").length,
-      blocked: hourRows.filter((row) => row.firewall_status === "BLOCKED").length,
+      blocked: hourRows.filter(
+        (row) =>
+          row.firewall_status === "BLOCKED" &&
+          row.signals.final_decision !== "REVIEW",
+      ).length,
+      review: hourRows.filter((row) => row.signals.final_decision === "REVIEW").length,
     });
   }
 

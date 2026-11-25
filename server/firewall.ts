@@ -1,4 +1,9 @@
-import type { FirewallDecision, FirewallRequest, ThreatCategory } from "../src/types.ts";
+import type {
+  FinalPolicyDecision,
+  FirewallDecision,
+  FirewallRequest,
+  ThreatCategory,
+} from "../src/types.ts";
 
 export interface FirewallSignals {
   character_entropy: number;
@@ -6,6 +11,7 @@ export interface FirewallSignals {
   punctuation_density: number;
   structural_irregularity: number;
   scanned_characters: number;
+  final_decision?: FinalPolicyDecision;
 }
 
 export interface FirewallEvaluation {

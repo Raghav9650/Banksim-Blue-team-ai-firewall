@@ -2,6 +2,24 @@ import type { EncryptedAuditEnvelope, FirewallRequest, UserAuditLog } from "./ty
 
 const banksimPasswordDerivationIterations = 600_000;
 const banksimKeyDerivationDomain = "BankSim account-private audit key v1";
+const banksimUserAuditKeyCache = new Map<string, CryptoKey>();
+const banksimUserAuditKeyCacheLimit = 4;
+
+export function clearUserAuditEncryptionKeyCache(): void {
+  banksimUserAuditKeyCache.clear();
+}
+
+async function createAuditKeyCacheIdentifier(
+  accountPassword: string,
+  accountId: string,
+  profileEncryptionSaltHex: string,
+): Promise<string> {
+  const cacheMaterial = new TextEncoder().encode(
+    `${banksimKeyDerivationDomain}\u0000${accountId}\u0000${profileEncryptionSaltHex.toLowerCase()}\u0000${accountPassword}`,
+  );
+  const fingerprint = new Uint8Array(await crypto.subtle.digest("SHA-256", cacheMaterial));
+  return Array.from(fingerprint, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 function bytesToBase64(bytes: Uint8Array): string {
   let binaryString = "";
@@ -35,6 +53,13 @@ export async function createUserAuditEncryptionKey(
   const saltBytes = Uint8Array.from(
     profileEncryptionSaltHex.match(/.{2}/gu)!.map((hexByte) => Number.parseInt(hexByte, 16)),
   );
+  const cacheIdentifier = await createAuditKeyCacheIdentifier(
+    accountPassword,
+    accountId,
+    profileEncryptionSaltHex,
+  );
+  const cachedKey = banksimUserAuditKeyCache.get(cacheIdentifier);
+  if (cachedKey) return cachedKey;
 
   const passwordMaterial = await crypto.subtle.importKey(
     "raw",
@@ -43,7 +68,7 @@ export async function createUserAuditEncryptionKey(
     false,
     ["deriveKey"],
   );
-  return crypto.subtle.deriveKey(
+  const derivedKey = await crypto.subtle.deriveKey(
     {
       name: "PBKDF2",
       hash: "SHA-256",
@@ -55,6 +80,13 @@ export async function createUserAuditEncryptionKey(
     false,
     ["encrypt", "decrypt"],
   );
+  banksimUserAuditKeyCache.set(cacheIdentifier, derivedKey);
+  while (banksimUserAuditKeyCache.size > banksimUserAuditKeyCacheLimit) {
+    const oldestCacheIdentifier = banksimUserAuditKeyCache.keys().next().value as string | undefined;
+    if (!oldestCacheIdentifier) break;
+    banksimUserAuditKeyCache.delete(oldestCacheIdentifier);
+  }
+  return derivedKey;
 }
 
 export async function encryptPrivateAuditValue(
@@ -115,9 +147,26 @@ export async function decryptPrivateAuditValue(
       base64ToBytes(encryptedEnvelope.ciphertext),
     );
     return new TextDecoder().decode(clearTextBytes);
-  } catch {
-    throw new Error("Private audit record could not be decrypted with this account's encryption key.");
+  } catch (error) {
+    if (
+      error &&
+      typeof error === "object" &&
+      "name" in error &&
+      error.name === "OperationError"
+    ) {
+      throw new Error(
+        "Encrypted with prior credentials: private audit record could not be decrypted with this account's encryption key.",
+        { cause: error },
+      );
+    }
+    throw new Error("Private audit record could not be decrypted with this account's encryption key.", {
+      cause: error,
+    });
   }
+}
+
+export function isPriorCredentialsDecryptionError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith("Encrypted with prior credentials:");
 }
 
 export async function encryptAuditRequest(
@@ -131,10 +180,22 @@ export async function decryptAuditLog(
   privateAuditKey: CryptoKey,
   encryptedLog: UserAuditLog,
 ): Promise<UserAuditLog> {
-  const decryptedRequestText = await decryptPrivateAuditValue(
-    privateAuditKey,
-    encryptedLog.incoming_prompt,
-  );
+  let decryptedRequestText: string;
+  try {
+    decryptedRequestText = await decryptPrivateAuditValue(
+      privateAuditKey,
+      encryptedLog.incoming_prompt,
+    );
+  } catch (error) {
+    if (!isPriorCredentialsDecryptionError(error)) throw error;
+    return {
+      ...encryptedLog,
+      incoming_prompt: "Encrypted with prior credentials",
+      sanitized_payload: encryptedLog.sanitized_payload
+        ? "Encrypted with prior credentials"
+        : null,
+    };
+  }
   let parsedRequest: FirewallRequest;
   try {
     const parsedPayload: unknown = JSON.parse(decryptedRequestText);
@@ -168,17 +229,22 @@ export async function decryptAuditLog(
 
   let sanitizedPayload: string | null = null;
   if (encryptedLog.sanitized_payload) {
-    const decryptedApprovedPayload = await decryptPrivateAuditValue(
-      privateAuditKey,
-      encryptedLog.sanitized_payload,
-    );
-    sanitizedPayload = JSON.stringify({
-      ...parsedRequest,
-      memo: parsedRequest.memo.normalize("NFKC").replace(/\s+/gu, " ").trim(),
-      signals: encryptedLog.signals,
-      compliance_hash: encryptedLog.compliance_hash,
-      encrypted_payload: decryptedApprovedPayload,
-    });
+    try {
+      const decryptedApprovedPayload = await decryptPrivateAuditValue(
+        privateAuditKey,
+        encryptedLog.sanitized_payload,
+      );
+      sanitizedPayload = JSON.stringify({
+        ...parsedRequest,
+        memo: parsedRequest.memo.normalize("NFKC").replace(/\s+/gu, " ").trim(),
+        signals: encryptedLog.signals,
+        compliance_hash: encryptedLog.compliance_hash,
+        encrypted_payload: decryptedApprovedPayload,
+      });
+    } catch (error) {
+      if (!isPriorCredentialsDecryptionError(error)) throw error;
+      sanitizedPayload = "Encrypted with prior credentials";
+    }
   }
 
   return { ...encryptedLog, incoming_prompt: incomingPrompt, sanitized_payload: sanitizedPayload };

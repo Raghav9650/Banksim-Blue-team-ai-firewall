@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { FirewallRequest } from "../src/types";
 import { evaluateBankSimFirewall } from "../server/firewall";
+import {
+  combineHybridFirewallDecision,
+  normalizeBankSimRequest,
+  redactGeminiPii,
+} from "../server/ai-analyzer";
 
 function buildFirewallRequest(memo: string): FirewallRequest {
   return {
@@ -84,5 +89,97 @@ describe("BankSim firewall heuristic", () => {
     expect(assessment.decision.risk_score).toBeLessThanOrEqual(1);
     expect(assessment.signals.scanned_characters).toBeGreaterThan(0);
     expect(assessment.sanitized_memo).not.toContain("\u200b");
+  });
+
+  it("normalizes Unicode and strips dangerous zero-width controls before analysis", () => {
+    const normalized = normalizeBankSimRequest({
+      ...buildFirewallRequest("  Invoice\u200b details  "),
+      encrypted_audit_payload: "encrypted-envelope",
+      idempotency_key: "6765b32b-0959-45ad-80ec-1088b695ca6e",
+    });
+
+    expect(normalized.memo).toBe("Invoice details");
+    expect(normalized.encrypted_audit_payload).toBe("encrypted-envelope");
+    expect(normalized.idempotency_key).toBe("6765b32b-0959-45ad-80ec-1088b695ca6e");
+  });
+
+  it("redacts common PII and credential-shaped text before Gemini analysis", () => {
+    const redacted = redactGeminiPii(
+      "Contact alex@example.com or 415-555-2671; account BS-ACCT2048; api_key=secret-value; card 4111111111111111",
+    );
+
+    expect(redacted).not.toContain("alex@example.com");
+    expect(redacted).not.toContain("415-555-2671");
+    expect(redacted).not.toContain("BS-ACCT2048");
+    expect(redacted).not.toContain("secret-value");
+    expect(redacted).not.toContain("4111111111111111");
+    expect(redacted).toContain("[EMAIL_REDACTED]");
+    expect(redacted).toContain("[CREDENTIAL_REDACTED]");
+  });
+
+  it("keeps a deterministic block above conflicting AI approval", () => {
+    const policy = combineHybridFirewallDecision("BLOCKED", 1, {
+      analysis: {
+        threatDetected: false,
+        threatCategory: "NONE",
+        riskScore: 0,
+        confidence: 0.9,
+        explanation: "No semantic threat detected.",
+        recommendedAction: "ALLOW",
+      },
+      status: "LIVE_AI",
+      durationMs: 42,
+      model: "test-model",
+    });
+
+    expect(policy.final_decision).toBe("BLOCK");
+  });
+
+  it("requires review at the exact AI risk threshold", () => {
+    const policy = combineHybridFirewallDecision("APPROVED", 0.1, {
+      analysis: {
+        threatDetected: true,
+        threatCategory: "MEMO_INJECTION",
+        riskScore: 45,
+        confidence: 0.8,
+        explanation: "Suspicious command wording.",
+        recommendedAction: "REVIEW",
+      },
+      status: "LIVE_AI",
+      durationMs: 55,
+      model: "test-model",
+    });
+
+    expect(policy.final_decision).toBe("REVIEW");
+  });
+
+  it("uses only deterministic approval when AI analysis is unavailable", () => {
+    const policy = combineHybridFirewallDecision("APPROVED", 0.1, {
+      analysis: null,
+      status: "AI_UNCONFIGURED",
+      durationMs: 1,
+      model: null,
+    });
+
+    expect(policy.final_decision).toBe("ALLOW");
+    expect(policy.ai.analysis).toBeNull();
+  });
+
+  it("does not allow a request when Gemini detects a threat at low risk", () => {
+    const policy = combineHybridFirewallDecision("APPROVED", 0.1, {
+      analysis: {
+        threatDetected: true,
+        threatCategory: "MEMO_INJECTION",
+        riskScore: 10,
+        confidence: 0.7,
+        explanation: "Suspicious embedded instruction.",
+        recommendedAction: "ALLOW",
+      },
+      status: "LIVE_AI",
+      durationMs: 42,
+      model: "test-model",
+    });
+
+    expect(policy.final_decision).toBe("REVIEW");
   });
 });
