@@ -130,12 +130,24 @@ grant select, insert on public.banksim_firewall_logs to service_role;
 revoke update, delete, truncate on public.banksim_firewall_logs
   from anon, authenticated, service_role;
 
+-- Allow deletes only from the foreign-key cascade after the owning Auth user is gone.
 create or replace function public.banksim_reject_firewall_log_mutation()
 returns trigger
 language plpgsql
+security definer
 set search_path = pg_catalog, public
 as $$
 begin
+  if tg_op = 'DELETE' then
+    if not exists (
+      select 1
+      from auth.users as auth_user
+      where auth_user.id = old.user_id
+    ) then
+      return old;
+    end if;
+  end if;
+
   raise exception 'BankSim firewall audit records are append-only.';
 end;
 $$;

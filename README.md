@@ -25,6 +25,7 @@ A personal defensive-fintech simulator with a custom request firewall, Supabase 
 - Deposits and transfers use PostgreSQL functions that lock affected profiles and commit balance changes and ledger entries atomically. A transfer creates a debit for the sender and a matching credit for the recipient. Unique request keys make network retries safe from double-posting. Simulated transactions are private and readable only through the owner-authenticated server API.
 - A sender's transfer memo is encrypted with that sender's private audit key before it is stored. The receiver sees an incoming-transfer entry without the sender's memo; BankSim does not share one user's private decryption key with another account.
 - The API persists the authenticated Supabase user ID as `user_id`, never a client-supplied owner ID. Supabase RLS applies `auth.uid() = user_id`; the trusted server also filters every admin-key query by that same verified owner ID.
+- Deleting a user from **Supabase → Authentication → Users** permanently deletes that user's profile, simulated transactions, and firewall audit logs through the existing foreign-key cascades. Audit logs remain immutable during normal use; their delete trigger only permits deletion after the owning Auth user has been removed. This cannot be undone.
 
 ## 2. Configure and run locally on Windows
 
